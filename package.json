@@ -1,0 +1,12 @@
+{
+  "name": "wp-store-import",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Import data from Velocity Toko & WooCommerce to WP Store",
+  "scripts": {
+    "build": "node scripts/zip.js"
+  },
+  "devDependencies": {
+    "archiver": "^5.3.1"
+  }
+}
