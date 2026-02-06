@@ -5,15 +5,21 @@ namespace WP_Store_Import\Migrator;
 class Runner
 {
 
-    public function run()
+    public function run($source = 'velocity')
     {
         $results = [
             'products' => 0,
+            'orders'   => 0,
             'errors'   => [],
         ];
 
-        $results['products'] = $this->migrate_products();
-        $results['orders']   = $this->migrate_orders();
+        if ($source === 'woocommerce') {
+            $results['products'] = $this->migrate_woocommerce_products();
+            $results['orders']   = $this->migrate_woocommerce_orders();
+        } else {
+            $results['products'] = $this->migrate_products();
+            $results['orders']   = $this->migrate_orders();
+        }
 
         return $results;
     }
@@ -191,15 +197,7 @@ class Runner
             set_post_thumbnail($new_id, $thumb_id);
         }
 
-        // Gallery
-        // Velocity Toko uses Meta Box 'image_advanced' which saves IDs in 'gallery' meta key.
-        // It might be single meta with array, or multiple meta?
-        // Usually Meta Box image_advanced saves as multiple meta values if not cloneable?
-        // But here it is NOT cloneable in the config I saw.
-        // Let's assume get_post_meta(..., false) to be safe.
-
         $gallery_ids = get_post_meta($old_id, 'gallery', false);
-        // If it's saved as serialized array (Meta Box sometimes does this)
         if (count($gallery_ids) === 1 && is_array($gallery_ids[0])) {
             $gallery_ids = $gallery_ids[0];
         }
@@ -217,6 +215,103 @@ class Runner
                 update_post_meta($new_id, '_store_gallery_ids', $gallery_data);
             }
         }
+    }
+
+    private function migrate_woocommerce_products()
+    {
+        $args = [
+            'post_type'      => 'product',
+            'posts_per_page' => -1,
+            'post_status'    => 'any',
+        ];
+        $query = new \WP_Query($args);
+        $count = 0;
+        if ($query->have_posts()) {
+            while ($query->have_posts()) {
+                $query->the_post();
+                $old_id = get_the_ID();
+                $existing = new \WP_Query([
+                    'post_type'      => 'store_product',
+                    'meta_key'       => '_woocommerce_original_id',
+                    'meta_value'     => $old_id,
+                    'post_status'    => 'any',
+                    'fields'         => 'ids',
+                    'posts_per_page' => 1,
+                ]);
+                if ($existing->have_posts()) {
+                    continue;
+                }
+                $post_data = [
+                    'post_title'   => get_the_title(),
+                    'post_content' => get_the_content(),
+                    'post_excerpt' => get_the_excerpt(),
+                    'post_status'  => get_post_status(),
+                    'post_type'    => 'store_product',
+                    'post_author'  => get_the_author_meta('ID'),
+                    'post_date'    => get_the_date('Y-m-d H:i:s'),
+                ];
+                $new_id = wp_insert_post($post_data);
+                if (! is_wp_error($new_id)) {
+                    $map = [
+                        '_sku'        => '_store_sku',
+                        '_price'      => '_store_price',
+                        '_sale_price' => '_store_sale_price',
+                        '_weight'     => '_store_weight_kg',
+                    ];
+                    foreach ($map as $old_key => $new_key) {
+                        $val = get_post_meta($old_id, $old_key, true);
+                        if ($val !== '') {
+                            update_post_meta($new_id, $new_key, $val);
+                        }
+                    }
+                    $manage = get_post_meta($old_id, '_manage_stock', true);
+                    if ($manage === 'yes') {
+                        $stock = get_post_meta($old_id, '_stock', true);
+                        if ($stock !== '') {
+                            update_post_meta($new_id, '_store_stock', $stock);
+                        }
+                    }
+                    update_post_meta($new_id, '_store_product_type', 'physical');
+                    update_post_meta($new_id, '_woocommerce_original_id', $old_id);
+                    $terms = get_the_terms($old_id, 'product_cat');
+                    if ($terms && ! is_wp_error($terms)) {
+                        $new_term_ids = [];
+                        foreach ($terms as $t) {
+                            $tid = $this->ensure_target_term($t, 'store_product_cat');
+                            if ($tid) {
+                                $new_term_ids[] = $tid;
+                            }
+                        }
+                        if (! empty($new_term_ids)) {
+                            wp_set_object_terms($new_id, $new_term_ids, 'store_product_cat');
+                        }
+                    }
+                    $thumb_id = get_post_thumbnail_id($old_id);
+                    if ($thumb_id) {
+                        set_post_thumbnail($new_id, $thumb_id);
+                    }
+                    $gallery = get_post_meta($old_id, '_product_image_gallery', true);
+                    if (! empty($gallery)) {
+                        $ids = array_filter(array_map('intval', array_map('trim', explode(',', $gallery))));
+                        if (! empty($ids)) {
+                            $g = [];
+                            foreach ($ids as $img_id) {
+                                $url = wp_get_attachment_url($img_id);
+                                if ($url) {
+                                    $g[$img_id] = $url;
+                                }
+                            }
+                            if (! empty($g)) {
+                                update_post_meta($new_id, '_store_gallery_ids', $g);
+                            }
+                        }
+                    }
+                    $count++;
+                }
+            }
+            wp_reset_postdata();
+        }
+        return $count;
     }
 
     private function migrate_orders()
@@ -410,6 +505,135 @@ class Runner
             'post_status' => 'any',
         ]);
 
+        if ($query->have_posts()) {
+            return $query->posts[0];
+        }
+        return 0;
+    }
+
+    private function migrate_woocommerce_orders()
+    {
+        $args = [
+            'post_type'      => 'shop_order',
+            'posts_per_page' => -1,
+            'post_status'    => 'any',
+            'fields'         => 'ids',
+        ];
+        $q = new \WP_Query($args);
+        $count = 0;
+        if ($q->have_posts()) {
+            global $wpdb;
+            $oi = $wpdb->prefix . 'woocommerce_order_items';
+            $oim = $wpdb->prefix . 'woocommerce_order_itemmeta';
+            while ($q->have_posts()) {
+                $q->the_post();
+                $old_id = get_the_ID();
+                $existing = new \WP_Query([
+                    'post_type'   => 'store_order',
+                    'meta_key'    => '_woocommerce_original_order_id',
+                    'meta_value'  => $old_id,
+                    'post_status' => 'any',
+                    'fields'      => 'ids',
+                    'posts_per_page' => 1,
+                ]);
+                if ($existing->have_posts()) {
+                    continue;
+                }
+                $status = get_post_status($old_id);
+                $map = [
+                    'wc-pending'    => 'pending',
+                    'wc-on-hold'    => 'awaiting_payment',
+                    'wc-processing' => 'processing',
+                    'wc-completed'  => 'completed',
+                    'wc-cancelled'  => 'cancelled',
+                    'wc-failed'     => 'cancelled',
+                    'wc-refunded'   => 'cancelled',
+                ];
+                $order_status = isset($map[$status]) ? $map[$status] : 'pending';
+                $post_data = [
+                    'post_title'  => 'Order #' . $old_id,
+                    'post_status' => 'publish',
+                    'post_type'   => 'store_order',
+                    'post_date'   => get_post_field('post_date', $old_id),
+                    'post_author' => 1,
+                ];
+                $new_id = wp_insert_post($post_data);
+                if (! is_wp_error($new_id)) {
+                    update_post_meta($new_id, '_woocommerce_original_order_id', $old_id);
+                    update_post_meta($new_id, '_store_order_status', $order_status);
+                    $fname = get_post_meta($old_id, '_billing_first_name', true);
+                    $lname = get_post_meta($old_id, '_billing_last_name', true);
+                    $nama = trim($fname . ' ' . $lname);
+                    $email = get_post_meta($old_id, '_billing_email', true);
+                    $phone = get_post_meta($old_id, '_billing_phone', true);
+                    $addr1 = get_post_meta($old_id, '_billing_address_1', true);
+                    $addr2 = get_post_meta($old_id, '_billing_address_2', true);
+                    $address = trim($addr1 . ' ' . $addr2);
+                    $city = get_post_meta($old_id, '_billing_city', true);
+                    $postal = get_post_meta($old_id, '_billing_postcode', true);
+                    $state = get_post_meta($old_id, '_billing_state', true);
+                    update_post_meta($new_id, '_store_order_customer_name', $nama);
+                    update_post_meta($new_id, '_store_order_email', $email);
+                    update_post_meta($new_id, '_store_order_phone', $phone);
+                    update_post_meta($new_id, '_store_order_address', $address);
+                    update_post_meta($new_id, '_store_order_city_name', $city);
+                    update_post_meta($new_id, '_store_order_province_name', $state);
+                    update_post_meta($new_id, '_store_order_postal_code', $postal);
+                    $shipping_total = (float) get_post_meta($old_id, '_shipping_total', true);
+                    $shipping_method = get_post_meta($old_id, '_shipping_method', true);
+                    update_post_meta($new_id, '_store_order_shipping_courier', $shipping_method);
+                    update_post_meta($new_id, '_store_order_shipping_service', '');
+                    update_post_meta($new_id, '_store_order_shipping_cost', $shipping_total);
+                    $pay_method = get_post_meta($old_id, '_payment_method', true);
+                    update_post_meta($new_id, '_store_order_payment_method', $pay_method);
+                    $items = [];
+                    $rows = $wpdb->get_results($wpdb->prepare(
+                        "SELECT order_item_id, order_item_name FROM $oi WHERE order_id = %d AND order_item_type = 'line_item'",
+                        $old_id
+                    ));
+                    foreach ($rows as $row) {
+                        $m = $wpdb->get_results($wpdb->prepare(
+                            "SELECT meta_key, meta_value FROM $oim WHERE order_item_id = %d AND meta_key IN ('_product_id','_variation_id','_qty','_line_total','_line_subtotal')",
+                            $row->order_item_id
+                        ));
+                        $meta = [];
+                        foreach ($m as $mm) {
+                            $meta[$mm->meta_key] = $mm->meta_value;
+                        }
+                        $old_pid = isset($meta['_product_id']) ? (int) $meta['_product_id'] : 0;
+                        $qty = isset($meta['_qty']) ? (int) $meta['_qty'] : 1;
+                        $line_total = isset($meta['_line_total']) ? (float) $meta['_line_total'] : 0.0;
+                        $price = $qty > 0 ? ($line_total / $qty) : 0.0;
+                        $new_pid = $this->get_new_product_id_from_woo($old_pid);
+                        $items[] = [
+                            'product_id' => $new_pid,
+                            'qty'        => $qty,
+                            'price'      => $price,
+                            'subtotal'   => $line_total,
+                            'options'    => [],
+                        ];
+                    }
+                    update_post_meta($new_id, '_store_order_items', $items);
+                    $total = (float) get_post_meta($old_id, '_order_total', true);
+                    update_post_meta($new_id, '_store_order_total', $total);
+                    $count++;
+                }
+            }
+            wp_reset_postdata();
+        }
+        return $count;
+    }
+
+    private function get_new_product_id_from_woo($old_id)
+    {
+        $query = new \WP_Query([
+            'post_type'  => 'store_product',
+            'meta_key'   => '_woocommerce_original_id',
+            'meta_value' => $old_id,
+            'posts_per_page' => 1,
+            'fields' => 'ids',
+            'post_status' => 'any',
+        ]);
         if ($query->have_posts()) {
             return $query->posts[0];
         }

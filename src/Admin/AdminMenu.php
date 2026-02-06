@@ -21,18 +21,22 @@ class AdminMenu {
 
 	public function render_page() {
 		?>
-		<div class="wrap">
-			<h1>Import from Velocity Toko</h1>
-			<p>Click the button below to start migrating data from Velocity Toko to WP Store.</p>
-			
-			<form method="post" action="">
-				<?php wp_nonce_field( 'wp_store_import_action', 'wp_store_import_nonce' ); ?>
-				<input type="hidden" name="action" value="wp_store_run_import">
-				<button type="submit" class="button button-primary">Start Import</button>
-			</form>
-            
+        <div class="wrap">
+            <h1>WP Store Import</h1>
+            <form method="post" action="">
+                <?php wp_nonce_field( 'wp_store_import_action', 'wp_store_import_nonce' ); ?>
+                <input type="hidden" name="action" value="wp_store_run_import">
+                <p>
+                    <label for="wp_store_import_source">Sumber Data</label><br>
+                    <select id="wp_store_import_source" name="source">
+                        <option value="velocity">Velocity Toko</option>
+                        <option value="woocommerce">WooCommerce</option>
+                    </select>
+                </p>
+                <button type="submit" class="button button-primary">Mulai Import</button>
+            </form>
             <div id="import-results" style="margin-top: 20px;"></div>
-		</div>
+        </div>
 		<?php
         
         $this->handle_import();
@@ -50,7 +54,8 @@ class AdminMenu {
 
             // Trigger migration
             $runner = new \WP_Store_Import\Migrator\Runner();
-            $results = $runner->run();
+            $source = isset($_POST['source']) ? sanitize_text_field($_POST['source']) : 'velocity';
+            $results = $runner->run($source);
 
             echo '<div class="notice notice-success"><p>Import completed!</p>';
             echo '<pre>' . print_r( $results, true ) . '</pre>';
