@@ -123,17 +123,44 @@ class Runner
         // Basic Options
         $namaopsi = get_post_meta($old_id, 'namaopsi', true);
         if ($namaopsi) {
-            update_post_meta($new_id, '_store_option_name', $namaopsi);
+            // Ensure string
+            if (is_array($namaopsi)) {
+                $namaopsi = isset($namaopsi[0]) ? $namaopsi[0] : '';
+            }
+            if (is_string($namaopsi)) {
+                update_post_meta($new_id, '_store_option_name', $namaopsi);
+            }
         }
-        $opsistandart = get_post_meta($old_id, 'opsistandart', false); // Array of strings
+
+        $opsistandart = get_post_meta($old_id, 'opsistandart', false);
         if (! empty($opsistandart) && is_array($opsistandart)) {
-            update_post_meta($new_id, '_store_options', $opsistandart);
+            $clean_options = [];
+            foreach ($opsistandart as $opt) {
+                if (is_array($opt)) {
+                    foreach ($opt as $sub_opt) {
+                        if (is_string($sub_opt)) {
+                            $clean_options[] = $sub_opt;
+                        }
+                    }
+                } elseif (is_string($opt)) {
+                    $clean_options[] = $opt;
+                }
+            }
+            if (! empty($clean_options)) {
+                update_post_meta($new_id, '_store_options', $clean_options);
+            }
         }
 
         // Advanced Options
         $namaopsi2 = get_post_meta($old_id, 'namaopsi2', true);
         if ($namaopsi2) {
-            update_post_meta($new_id, '_store_option2_name', $namaopsi2);
+            // Ensure string
+            if (is_array($namaopsi2)) {
+                $namaopsi2 = isset($namaopsi2[0]) ? $namaopsi2[0] : '';
+            }
+            if (is_string($namaopsi2)) {
+                update_post_meta($new_id, '_store_option2_name', $namaopsi2);
+            }
         }
         $opsiharga = get_post_meta($old_id, 'opsiharga', false); // Array of strings like "Label=Price"
         if (! empty($opsiharga) && is_array($opsiharga)) {
@@ -195,27 +222,53 @@ class Runner
         if (! $source_term || is_wp_error($source_term)) {
             return 0;
         }
-        $existing = term_exists($source_term->name, $target_tax);
-        if ($existing) {
-            return is_array($existing) ? (int) $existing['term_id'] : (int) $existing;
-        }
+
+        // 1. Resolve Parent Recursively
         $parent_id = 0;
         if (! empty($source_term->parent)) {
-            $parent_source = get_term((int) $source_term->parent, 'category-product');
+            // Use the source taxonomy dynamically
+            $source_tax = $source_term->taxonomy;
+            $parent_source = get_term((int) $source_term->parent, $source_tax);
+
             if ($parent_source && ! is_wp_error($parent_source)) {
                 $parent_id = $this->ensure_target_term($parent_source, $target_tax);
             }
         }
+
+        // 2. Check if term exists within the specific parent context
+        // This ensures that "Parent A -> Child" and "Parent B -> Child" are treated as different terms
+        $existing = term_exists($source_term->name, $target_tax, $parent_id);
+
+        if ($existing) {
+            return is_array($existing) ? (int) $existing['term_id'] : (int) $existing;
+        }
+
+        // 3. Create Term
         $args = [
             'slug'   => $source_term->slug,
         ];
         if ($parent_id > 0) {
             $args['parent'] = $parent_id;
         }
+
         $created = wp_insert_term($source_term->name, $target_tax, $args);
+
         if (is_wp_error($created)) {
-            return 0;
+            // Fallback: Try without slug if slug collision occurred
+            if (isset($created->get_error_code) && $created->get_error_code() === 'term_exists') {
+                $existing_id = $created->get_error_data();
+                return (int) $existing_id;
+            }
+
+            // Retry without slug (let WP generate unique slug)
+            unset($args['slug']);
+            $created = wp_insert_term($source_term->name, $target_tax, $args);
+
+            if (is_wp_error($created)) {
+                return 0;
+            }
         }
+
         return (int) $created['term_id'];
     }
 
