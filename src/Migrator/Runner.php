@@ -13,12 +13,21 @@ class Runner
             'errors'   => [],
         ];
 
-        if ($source === 'woocommerce') {
-            $results['products'] = $this->migrate_woocommerce_products();
-            $results['orders']   = $this->migrate_woocommerce_orders();
-        } else {
-            $results['products'] = $this->migrate_products();
-            $results['orders']   = $this->migrate_orders();
+        try {
+            // Attempt to increase time limit
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(0);
+            }
+
+            if ($source === 'woocommerce') {
+                $results['products'] = $this->migrate_woocommerce_products();
+                $results['orders']   = $this->migrate_woocommerce_orders();
+            } else {
+                $results['products'] = $this->migrate_products();
+                $results['orders']   = $this->migrate_orders();
+            }
+        } catch (\Throwable $t) {
+            $results['errors'][] = $t->getMessage() . ' in ' . $t->getFile() . ':' . $t->getLine();
         }
 
         return $results;
@@ -130,6 +139,26 @@ class Runner
         if (! empty($opsiharga) && is_array($opsiharga)) {
             $advanced_options = [];
             foreach ($opsiharga as $row) {
+                // Handle nested arrays (serialized data)
+                if (is_array($row)) {
+                    foreach ($row as $sub_row) {
+                        if (is_string($sub_row)) {
+                            $parts = explode('=', $sub_row);
+                            if (count($parts) >= 2) {
+                                $advanced_options[] = [
+                                    'label' => trim($parts[0]),
+                                    'price' => trim($parts[1]),
+                                ];
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (! is_string($row)) {
+                    continue;
+                }
+
                 $parts = explode('=', $row);
                 if (count($parts) >= 2) {
                     $advanced_options[] = [
@@ -324,156 +353,166 @@ class Runner
             return 0;
         }
 
-        $orders = $wpdb->get_results("SELECT * FROM $table_order ORDER BY id DESC");
         $count = 0;
+        $limit = 50;
+        $offset = 0;
 
-        foreach ($orders as $order) {
-            $invoice = $order->invoice;
+        while (true) {
+            $orders = $wpdb->get_results($wpdb->prepare("SELECT * FROM $table_order ORDER BY id DESC LIMIT %d OFFSET %d", $limit, $offset));
 
-            // Check if exists
-            $existing = new \WP_Query([
-                'post_type'  => 'store_order',
-                'meta_key'   => '_velocity_original_invoice',
-                'meta_value' => $invoice,
-                'post_status' => 'any',
-            ]);
-
-            if ($existing->have_posts()) {
-                continue;
+            if (empty($orders)) {
+                break;
             }
 
-            $detail = json_decode($order->detail, true);
+            foreach ($orders as $order) {
+                $invoice = $order->invoice;
 
-            // Map Status
-            $status_map = [
-                'Transaksi Baru' => 'pending',
-                'Menunggu Pembayaran' => 'pending',
-                'Lunas'          => 'processing',
-                'Proses'         => 'processing',
-                'Dikirim'        => 'shipped',
-                'Selesai'        => 'completed',
-                'Batal'          => 'cancelled',
-            ];
+                // Check if exists
+                $existing = new \WP_Query([
+                    'post_type'  => 'store_order',
+                    'meta_key'   => '_velocity_original_invoice',
+                    'meta_value' => $invoice,
+                    'post_status' => 'any',
+                ]);
 
-            $order_status = isset($order->status) && isset($status_map[$order->status])
-                ? $status_map[$order->status]
-                : 'pending';
-
-            $post_data = [
-                'post_title'   => 'Order ' . $invoice,
-                'post_status'  => 'publish', // store_order is always publish, status is in meta
-                'post_type'    => 'store_order',
-                'post_date'    => date('Y-m-d H:i:s', strtotime($order->date)),
-                'post_author'  => $order->id_pembeli > 0 ? $order->id_pembeli : 1,
-            ];
-
-            $new_id = wp_insert_post($post_data);
-
-            if (! is_wp_error($new_id)) {
-                update_post_meta($new_id, '_velocity_original_invoice', $invoice);
-                update_post_meta($new_id, '_velocity_original_order_id', $order->id);
-
-                // Status
-                update_post_meta($new_id, '_store_order_status', $order_status);
-
-                // Customer Info
-                $nama   = isset($detail['nama']) ? $detail['nama'] : '';
-                $email  = isset($detail['email']) ? $detail['email'] : '';
-                $hp     = isset($detail['hp']) ? $detail['hp'] : '';
-                $alamat = isset($detail['alamat']) ? $detail['alamat'] : '';
-
-                update_post_meta($new_id, '_store_order_customer_name', $nama); // Custom meta for display if needed
-                update_post_meta($new_id, '_store_order_email', $email);
-                update_post_meta($new_id, '_store_order_phone', $hp);
-                update_post_meta($new_id, '_store_order_address', $alamat);
-
-                // Location
-                if (isset($detail['subdistrict_destination'])) {
-                    $loc = $this->get_location_details($detail['subdistrict_destination']);
-                    if ($loc) {
-                        update_post_meta($new_id, '_store_order_subdistrict_name', $loc->subdistrict_name);
-                        update_post_meta($new_id, '_store_order_city_name', $loc->city_name);
-                        update_post_meta($new_id, '_store_order_province_name', $loc->province);
-                        update_post_meta($new_id, '_store_order_postal_code', $loc->postal_code);
-                    }
+                if ($existing->have_posts()) {
+                    continue;
                 }
 
-                // Shipping
-                // Ongkir format: "JNE - REG - 15.000"
-                $ongkir_str = isset($detail['ongkir']) ? $detail['ongkir'] : '';
-                $parts = explode('-', $ongkir_str);
-                $courier = isset($parts[0]) ? trim($parts[0]) : '';
-                $service = isset($parts[1]) ? trim($parts[1]) : '';
-                $cost_str = isset($parts[2]) ? trim($parts[2]) : '0';
-                $cost = (float) str_replace(['.', ','], '', $cost_str); // Remove dots, assume IDR
+                $detail = json_decode($order->detail, true);
 
-                update_post_meta($new_id, '_store_order_shipping_courier', $courier);
-                update_post_meta($new_id, '_store_order_shipping_service', $service);
-                update_post_meta($new_id, '_store_order_shipping_cost', $cost);
+                // Map Status
+                $status_map = [
+                    'Transaksi Baru' => 'pending',
+                    'Menunggu Pembayaran' => 'pending',
+                    'Lunas'          => 'processing',
+                    'Proses'         => 'processing',
+                    'Dikirim'        => 'shipped',
+                    'Selesai'        => 'completed',
+                    'Batal'          => 'cancelled',
+                ];
 
-                update_post_meta($new_id, '_store_order_tracking_number', $order->resi);
+                $order_status = isset($order->status) && isset($status_map[$order->status])
+                    ? $status_map[$order->status]
+                    : 'pending';
 
-                // Payment
-                update_post_meta($new_id, '_store_order_payment_method', $order->pembayaran);
+                $post_data = [
+                    'post_title'   => 'Order ' . $invoice,
+                    'post_status'  => 'publish', // store_order is always publish, status is in meta
+                    'post_type'    => 'store_order',
+                    'post_date'    => date('Y-m-d H:i:s', strtotime($order->date)),
+                    'post_author'  => $order->id_pembeli > 0 ? $order->id_pembeli : 1,
+                ];
 
-                // Items
-                $items = [];
-                $subtotal_accumulated = 0;
+                $new_id = wp_insert_post($post_data);
 
-                if (isset($detail['produk']['products']) && is_array($detail['produk']['products'])) {
-                    foreach ($detail['produk']['products'] as $item) {
-                        $old_pid = isset($item['id']) ? $item['id'] : 0;
-                        $qty = isset($item['jumlah']) ? (int) $item['jumlah'] : 1;
+                if (! is_wp_error($new_id)) {
+                    update_post_meta($new_id, '_velocity_original_invoice', $invoice);
+                    update_post_meta($new_id, '_velocity_original_order_id', $order->id);
 
-                        // Find new Product ID
-                        $new_pid = $this->get_new_product_id($old_pid);
+                    // Status
+                    update_post_meta($new_id, '_store_order_status', $order_status);
 
-                        // Price? Velocity doesn't seem to store price per item in the JSON clearly?
-                        // Or maybe it does? Check finish.php again. 
-                        // It loops and updates stock, but doesn't show price saving.
-                        // Assuming it's not in the simple JSON, we might need to look it up or infer.
-                        // Wait, finish.php passes $_POST.
-                        // And Keranjang usually has price.
-                        // Let's assume $item['harga'] exists or we fetch from new product.
-                        // If price is missing, use current price (fallback).
+                    // Customer Info
+                    $nama   = isset($detail['nama']) ? $detail['nama'] : '';
+                    $email  = isset($detail['email']) ? $detail['email'] : '';
+                    $hp     = isset($detail['hp']) ? $detail['hp'] : '';
+                    $alamat = isset($detail['alamat']) ? $detail['alamat'] : '';
 
-                        $price = 0;
-                        if (isset($item['harga'])) {
-                            $price = (float) $item['harga'];
-                        } elseif ($new_pid) {
-                            $price = (float) get_post_meta($new_pid, '_store_price', true);
+                    update_post_meta($new_id, '_store_order_customer_name', $nama); // Custom meta for display if needed
+                    update_post_meta($new_id, '_store_order_email', $email);
+                    update_post_meta($new_id, '_store_order_phone', $hp);
+                    update_post_meta($new_id, '_store_order_address', $alamat);
+
+                    // Location
+                    if (isset($detail['subdistrict_destination'])) {
+                        $loc = $this->get_location_details($detail['subdistrict_destination']);
+                        if ($loc) {
+                            update_post_meta($new_id, '_store_order_subdistrict_name', $loc->subdistrict_name);
+                            update_post_meta($new_id, '_store_order_city_name', $loc->city_name);
+                            update_post_meta($new_id, '_store_order_province_name', $loc->province);
+                            update_post_meta($new_id, '_store_order_postal_code', $loc->postal_code);
                         }
-
-                        $line_subtotal = $price * $qty;
-                        $subtotal_accumulated += $line_subtotal;
-
-                        // Options
-                        // Velocity: "ket" (keterangan) or similar?
-                        // Let's check $item keys if possible. For now leave empty.
-                        $options = [];
-                        if (isset($item['keterangan'])) {
-                            $options['Info'] = $item['keterangan'];
-                        }
-
-                        $items[] = [
-                            'product_id' => $new_pid,
-                            'qty'        => $qty,
-                            'price'      => $price,
-                            'subtotal'   => $line_subtotal,
-                            'options'    => $options,
-                        ];
                     }
+
+                    // Shipping
+                    // Ongkir format: "JNE - REG - 15.000"
+                    $ongkir_str = isset($detail['ongkir']) ? $detail['ongkir'] : '';
+                    $parts = explode('-', $ongkir_str);
+                    $courier = isset($parts[0]) ? trim($parts[0]) : '';
+                    $service = isset($parts[1]) ? trim($parts[1]) : '';
+                    $cost_str = isset($parts[2]) ? trim($parts[2]) : '0';
+                    $cost = (float) str_replace(['.', ','], '', $cost_str); // Remove dots, assume IDR
+
+                    update_post_meta($new_id, '_store_order_shipping_courier', $courier);
+                    update_post_meta($new_id, '_store_order_shipping_service', $service);
+                    update_post_meta($new_id, '_store_order_shipping_cost', $cost);
+
+                    update_post_meta($new_id, '_store_order_tracking_number', $order->resi);
+
+                    // Payment
+                    update_post_meta($new_id, '_store_order_payment_method', $order->pembayaran);
+
+                    // Items
+                    $items = [];
+                    $subtotal_accumulated = 0;
+
+                    if (isset($detail['produk']['products']) && is_array($detail['produk']['products'])) {
+                        foreach ($detail['produk']['products'] as $item) {
+                            $old_pid = isset($item['id']) ? $item['id'] : 0;
+                            $qty = isset($item['jumlah']) ? (int) $item['jumlah'] : 1;
+
+                            // Find new Product ID
+                            $new_pid = $this->get_new_product_id($old_pid);
+
+                            // Price? Velocity doesn't seem to store price per item in the JSON clearly?
+                            // Or maybe it does? Check finish.php again. 
+                            // It loops and updates stock, but doesn't show price saving.
+                            // Assuming it's not in the simple JSON, we might need to look it up or infer.
+                            // Wait, finish.php passes $_POST.
+                            // And Keranjang usually has price.
+                            // Let's assume $item['harga'] exists or we fetch from new product.
+                            // If price is missing, use current price (fallback).
+
+                            $price = 0;
+                            if (isset($item['harga'])) {
+                                $price = (float) $item['harga'];
+                            } elseif ($new_pid) {
+                                $price = (float) get_post_meta($new_pid, '_store_price', true);
+                            }
+
+                            $line_subtotal = $price * $qty;
+                            $subtotal_accumulated += $line_subtotal;
+
+                            // Options
+                            // Velocity: "ket" (keterangan) or similar?
+                            // Let's check $item keys if possible. For now leave empty.
+                            $options = [];
+                            if (isset($item['keterangan'])) {
+                                $options['Info'] = $item['keterangan'];
+                            }
+
+                            $items[] = [
+                                'product_id' => $new_pid,
+                                'qty'        => $qty,
+                                'price'      => $price,
+                                'subtotal'   => $line_subtotal,
+                                'options'    => $options,
+                            ];
+                        }
+                    }
+
+                    update_post_meta($new_id, '_store_order_items', $items);
+
+                    // Total
+                    // Order table has 'total' column
+                    $total = (float) $order->total;
+                    update_post_meta($new_id, '_store_order_total', $total);
+
+                    $count++;
                 }
-
-                update_post_meta($new_id, '_store_order_items', $items);
-
-                // Total
-                // Order table has 'total' column
-                $total = (float) $order->total;
-                update_post_meta($new_id, '_store_order_total', $total);
-
-                $count++;
             }
+            $offset += $limit;
         }
 
         return $count;
